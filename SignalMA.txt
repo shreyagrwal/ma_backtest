@@ -1,0 +1,189 @@
+from SignalMasterABC import SignalMaster
+from modules import TradingBook
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+do_print = False
+TRADINGBEGIN = '2001'
+# Each class needs to re-read the
+
+
+class MaPenetration(SignalMaster):
+
+    def __init__(self, first_rolling, second_rolling, atr_stop_loss, entry_atr=0):
+        super().__init__()
+        self.first_rolling = first_rolling
+        self.second_rolling = second_rolling
+        self.atr_stop_loss = atr_stop_loss
+        self.entry_atr = entry_atr
+        self.trade_checking_df = pd.DataFrame()
+        self.recap_arr = []
+        self.my_date_list = []
+        self.no_trade_ratio = 1  # This is 20/50 MA filter. 1 means no filter is applied
+        self.signal_df = None
+
+    def get_signal_df(self):
+
+        signal_df = self.df2m.copy()
+        signal_df['rolling_ma_first'] = signal_df['Close'].rolling(self.first_rolling).mean()
+        signal_df['rolling_ma_second'] = signal_df['Close'].rolling(self.second_rolling).mean()
+        signal_df['rolling_sum_first_minus1'] = signal_df['Close'].rolling(self.first_rolling - 1).sum().shift()
+        signal_df['rolling_sum_second_minus1'] = signal_df['Close'].rolling(self.second_rolling - 1).sum().shift()
+
+        # The identifier should use shift as we do not know the close price
+        signal_df['rolling_ma_20'] = signal_df['Close'].shift().rolling(20).mean()
+        signal_df['rolling_ma_50'] = signal_df['Close'].shift().rolling(50).mean()
+
+        signal_df['rolling_gap'] = signal_df['rolling_ma_first'] - signal_df['rolling_ma_second']
+        signal_df['TradingVol'] = (100 / self.ser_atr).fillna(0).astype(int)
+        signal_df = signal_df.dropna()
+
+        signal_df['previous_gap'] = signal_df['rolling_gap'].shift(1)
+        signal_df['crossing'] = (signal_df['rolling_gap'] * signal_df['previous_gap']) < 0
+
+        signal_df['target_open_price'] = ((signal_df['rolling_sum_second_minus1'] * self.first_rolling -
+                                           signal_df['rolling_sum_first_minus1'] * self.second_rolling) /
+                                          (self.second_rolling - self.first_rolling))
+
+        signal_df['target_open_price'] = (signal_df['target_open_price'] +
+                                          self.ser_atr.loc[signal_df.index] *
+                                          self.entry_atr * np.where(signal_df['previous_gap'] > 0, -1, 1)).round(2)
+        self.signal_df = signal_df
+
+    def signal_execution_backtesting(self):
+
+        if self.signal_df is None:
+            self.get_signal_df()
+
+        my_book = TradingBook()
+
+        for my_date, row_ind in self.signal_df.loc[TRADINGBEGIN:].iterrows():
+
+            # Trade Size
+            t_size = row_ind['TradingVol']
+            if do_print:
+                print('-' * 55)
+                print(my_date)
+
+            self.trade_checking_df.loc[my_date, 'rolling_gap'] = row_ind['rolling_gap']
+            self.trade_checking_df.loc[my_date, 'previous_gap'] = row_ind['previous_gap']
+            self.trade_checking_df.loc[my_date, 'Open'] = row_ind['Open']
+            self.trade_checking_df.loc[my_date, 'High'] = row_ind['High']
+            self.trade_checking_df.loc[my_date, 'Low'] = row_ind['Low']
+
+            row_m2 = self.df2m.loc[my_date]
+            i_atr = self.ser_atr.loc[my_date]
+
+            if row_m2.isna().any():
+                continue
+
+            my_position = my_book.position('FP')
+            self.trade_checking_df.loc[my_date, 'open_position'] = my_position
+            if my_position != 0:
+                position_price = my_book.get_avg_open_price('FP')
+                self.trade_checking_df.loc[my_date, 'open_position_price'] = position_price
+            trade_price = np.NaN
+            # go from bottom to top
+            if row_ind['previous_gap'] < 0:
+                if row_ind['target_open_price'] <= row_ind['Open']:
+                    trade_price = row_ind['Open']
+                elif row_ind['High'] >= row_ind['target_open_price']:
+                    trade_price = row_ind['target_open_price']
+
+                if not np.isnan(trade_price):
+                    target_trade = t_size
+
+                    if row_ind['rolling_ma_20'] <= row_ind['rolling_ma_50']:
+                        target_trade *= self.no_trade_ratio
+                    trading_vol = target_trade - my_position
+                    if trading_vol != 0:
+                        my_book.trade(my_date, 'FP', trading_vol, trade_price, self.contract_size)
+                        self.trade_checking_df.loc[my_date, 'trade_price'] = trade_price
+                        self.trade_checking_df.loc[my_date, 'trade_vol'] = trading_vol
+                        self.trade_checking_df.loc[my_date, 'checktrade'] = 1
+                        if do_print:
+                            print('-' * 55)
+                            print("Trade {} at {}".format(trading_vol, trade_price))
+
+            # go from top to bottom
+            elif row_ind['previous_gap'] > 0:
+                if row_ind['target_open_price'] >= row_ind['Open']:
+                    trade_price = row_ind['Open']
+                elif row_ind['Low'] <= row_ind['target_open_price']:
+                    trade_price = row_ind['target_open_price']
+
+                if not np.isnan(trade_price):
+                    target_trade = -t_size
+
+                    if row_ind['rolling_ma_20'] >= row_ind['rolling_ma_50']:
+                        target_trade *= self.no_trade_ratio
+
+                    trading_vol = target_trade - my_position
+
+                    if trading_vol != 0:
+                        my_book.trade(my_date, 'FP', trading_vol, trade_price, self.contract_size)
+                        self.trade_checking_df.loc[my_date, 'trade_price'] = trade_price
+                        self.trade_checking_df.loc[my_date, 'trade_vol'] = trading_vol
+                        self.trade_checking_df.loc[my_date, 'checktrade'] = 1
+                        if do_print:
+                            print('-' * 55)
+                            print("Trade {} at {}".format(trading_vol, trade_price))
+
+            my_position = my_book.position('FP')
+            # Now the stop loss
+            if my_position < 0:
+                position_price = my_book.get_avg_open_price('FP')
+                stop_loss_target = np.round(position_price + self.atr_stop_loss * i_atr, 2)
+                # Stop loss
+                if row_m2['High'] > stop_loss_target:
+                    my_book.trade(my_date, 'FP', -my_position, stop_loss_target, self.contract_size)
+                    self.trade_checking_df.loc[my_date, 'stop_price_short'] = stop_loss_target
+                    self.trade_checking_df.loc[my_date, 'stop_cost_short'] = position_price
+                    self.trade_checking_df.loc[my_date, 'stop_atr_short'] = self.atr_stop_loss * i_atr
+                    self.trade_checking_df.loc[my_date, 'trade_vol_stop'] = my_position
+                    self.trade_checking_df.loc[my_date, 'checktrade'] = 1
+                    my_position = 0
+                    if do_print:
+                        print('-' * 55)
+                        print("Short Stop Loss, {} at ATR Loss {}".format(stop_loss_target, self.atr_stop_loss * i_atr))
+            elif my_position > 0:
+                position_price = my_book.get_avg_open_price('FP')
+                stop_loss_target = np.round(position_price - self.atr_stop_loss * i_atr, 2)
+                # Stop loss
+                if row_m2['Low'] < stop_loss_target:
+                    my_book.trade(my_date, 'FP', -my_position, stop_loss_target, self.contract_size)
+                    self.trade_checking_df.loc[my_date, 'stop_price_long'] = stop_loss_target
+                    self.trade_checking_df.loc[my_date, 'stop_cost_long'] = position_price
+                    self.trade_checking_df.loc[my_date, 'stop_atr_long'] = self.atr_stop_loss * i_atr
+                    self.trade_checking_df.loc[my_date, 'trade_vol_stop'] = -my_position
+                    self.trade_checking_df.loc[my_date, 'checktrade'] = 1
+                    my_position = 0
+                    if do_print:
+                        print('-' * 55)
+                        print("Long Stop Loss, {} at ATR Loss {}".format(stop_loss_target, self.atr_stop_loss * i_atr))
+
+            # Rolling logic
+            if my_position != 0:
+                position_rolled = self.check_rolling(my_date, my_book)
+                if position_rolled and do_print:
+                    _position_price = my_book.get_avg_open_price('FP')
+                    print('-' * 55)
+                    print("position price has been changed from {} to {}".format(trade_price, _position_price))
+
+            pos_fp = my_book.position('FP')
+            total_pnl = my_book.total_pnl('FP', row_m2['Close'], self.contract_size)
+
+            recap_row = {}
+            recap_row['FP Price'] = row_m2['Close']
+            recap_row['FP Pos'] = pos_fp
+            recap_row['P&L'] = total_pnl
+
+            # Index
+            self.my_date_list.append(my_date)
+            self.recap_arr.append(recap_row)
+
+        df_book = pd.DataFrame(self.recap_arr)
+        df_book.index = self.my_date_list
+
+        return df_book, self.trade_checking_df, self.signal_df
